@@ -1,0 +1,140 @@
+<!doctype html><html lang=en-uk><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Writing our own event loops in python | ~simmsb</title><link rel=stylesheet href=/css/style.min.a82f329c90a5548a1b3eecd176d00a0a88e3f75617326a1e59758ac3d2147c4d.css><header><nav><ul><li class=pull-left><a href>/home/~simmsb</a></li></ul></nav></header></head><body><br><div class=article-meta><h1><span class=title>Writing our own event loops in python</span></h1><h2 class=author>[Ben Simms]</h2><h2 class=date>2019/03/20</h2><p class=terms>Tags: <a href=/tags/python>python</a> <a href=/tags/programming>programming</a></p></div><main><p>One of the good features of python is it&rsquo;s native support for coroutines,
+generalised functions that can be paused and resumed, allowing objects to be
+passed between the coroutine and whoever is running them when at the time.</p><p>The most widely used place for Python&rsquo;s coroutines currently is in asyncio
+frameworks, namely the standard library module: AsyncIO, <a href=https://github.com/python-trio/trio>Trio</a>, and <a href=https://github.com/dabeaz/curio>Curio</a>. These
+use python coroutines to allow the user to write code that requires IO resources
+that may not be available at some point when their code runs, but will be in the
+future. Without coroutine functions the alternative to this is promises, where
+an IO request has a function attached that will run when the IO has completed,
+however this approach leads to code becoming deeply nested and hard to work
+with.</p><p>Coroutines fix this by allowing the function to be paused whenever an IO request
+is made, the writer of the coroutine doesn&rsquo;t have to know that the function will
+be paused and can write their function as if the IO resource magically becomes
+available as soon as requested, they only need to insert the extra `await`
+keyword to retrieve the results of other coroutines.</p><p>An example of a &lsquo;blocking&rsquo; non async function:</p><div class=highlight><pre style=background-color:#f0f3f3;-moz-tab-size:4;-o-tab-size:4;tab-size:4><code class=language-python data-lang=python><span style=color:#069;font-weight:700>def</span> <span style=color:#c0f>make_request</span>(url):
+    result <span style=color:#555>=</span> my_http_lib<span style=color:#555>.</span>get(url)
+    <span style=color:#069;font-weight:700>return</span> result[<span style=color:#c30>&#34;data&#34;</span>][<span style=color:#c30>&#34;some_value&#34;</span>]
+</code></pre></div><p>This could be rewritten using promises to get:</p><div class=highlight><pre style=background-color:#f0f3f3;-moz-tab-size:4;-o-tab-size:4;tab-size:4><code class=language-python data-lang=python><span style=color:#069;font-weight:700>def</span> <span style=color:#c0f>make_request</span>(url):
+    <span style=color:#069;font-weight:700>return</span> my_http_lib<span style=color:#555>.</span>get(url)<span style=color:#555>.</span>then(<span style=color:#069;font-weight:700>lambda</span> r: r[<span style=color:#c30>&#34;data&#34;</span>][<span style=color:#c30>&#34;some_value&#34;</span>])
+</code></pre></div><p>However that leads to messy code happening quickly, instead async functions the
+following could be written:</p><div class=highlight><pre style=background-color:#f0f3f3;-moz-tab-size:4;-o-tab-size:4;tab-size:4><code class=language-python data-lang=python>async <span style=color:#069;font-weight:700>def</span> <span style=color:#c0f>make_request</span>(url):
+    result <span style=color:#555>=</span> await my_async_http_lib<span style=color:#555>.</span>get(url)
+    <span style=color:#069;font-weight:700>return</span> result[<span style=color:#c30>&#34;data&#34;</span>][<span style=color:#c30>&#34;some_value&#34;</span>]
+</code></pre></div><p>Which as you can see, is practically identical in structure to the blocking version.</p><p>Asynchronous IO isn&rsquo;t the only problem that can be solved using coroutines, I am
+now going to show how you can use coroutines to write a program that can resolve
+references written in any order.</p><p>First, we need an object to signal actions to the event loop:</p><div class=highlight><pre style=background-color:#f0f3f3;-moz-tab-size:4;-o-tab-size:4;tab-size:4><code class=language-python data-lang=python><span style=color:#069;font-weight:700>from</span> <span style=color:#0cf;font-weight:700>enum</span> <span style=color:#069;font-weight:700>import</span> Enum, auto
+
+<span style=color:#069;font-weight:700>class</span> <span style=color:#0a8;font-weight:700>RequestType</span>(Enum):
+    set_var <span style=color:#555>=</span> auto()
+    get_var <span style=color:#555>=</span> auto()
+</code></pre></div><p>We&rsquo;ll use tuples of a request and arguemtns to signal to the event loop what we
+want performing.</p><p>Then we need an event loop</p><div class=highlight><pre style=background-color:#f0f3f3;-moz-tab-size:4;-o-tab-size:4;tab-size:4><code class=language-python data-lang=python><span style=color:#069;font-weight:700>from</span> <span style=color:#0cf;font-weight:700>types</span> <span style=color:#069;font-weight:700>import</span> coroutine
+<span style=color:#069;font-weight:700>from</span> <span style=color:#0cf;font-weight:700>dataclasses</span> <span style=color:#069;font-weight:700>import</span> dataclass
+
+
+<span style=color:#99f>@dataclass</span>
+<span style=color:#069;font-weight:700>class</span> <span style=color:#0a8;font-weight:700>EventObject</span>:
+    coro: coroutine  <span style=color:#09f;font-style:italic># the running coroutine</span>
+    response: <span style=color:#366>object</span> <span style=color:#555>=</span> None  <span style=color:#09f;font-style:italic># the value to send to the object</span>
+
+
+<span style=color:#069;font-weight:700>class</span> <span style=color:#0a8;font-weight:700>ELoop</span>:
+    <span style=color:#069;font-weight:700>def</span> __init__(self):
+        self<span style=color:#555>.</span>waiting <span style=color:#555>=</span> {}
+        self<span style=color:#555>.</span>queue <span style=color:#555>=</span> []
+        self<span style=color:#555>.</span>namespace <span style=color:#555>=</span> {}
+
+    <span style=color:#069;font-weight:700>def</span> <span style=color:#c0f>sleep</span>(self, obj, name):
+        <span style=color:#09f;font-style:italic># multiple coros may wait on the same name, so store in a list</span>
+        also_waiting <span style=color:#555>=</span> self<span style=color:#555>.</span>waiting<span style=color:#555>.</span>setdefault(name, [])
+        also_waiting<span style=color:#555>.</span>append(obj)
+
+    <span style=color:#069;font-weight:700>def</span> <span style=color:#c0f>run_once</span>(self):
+        obj <span style=color:#555>=</span> self<span style=color:#555>.</span>queue<span style=color:#555>.</span>pop()
+
+        <span style=color:#069;font-weight:700>while</span> True:
+            <span style=color:#069;font-weight:700>try</span>:
+                task, <span style=color:#555>*</span>args <span style=color:#555>=</span> obj<span style=color:#555>.</span>coro<span style=color:#555>.</span>send(obj<span style=color:#555>.</span>response)
+                obj<span style=color:#555>.</span>response <span style=color:#555>=</span> None  <span style=color:#09f;font-style:italic># reset to none after sending</span>
+            <span style=color:#069;font-weight:700>except</span> <span style=color:#c00;font-weight:700>StopIteration</span>:
+                <span style=color:#069;font-weight:700>return</span>
+
+            <span style=color:#069;font-weight:700>if</span> task <span style=color:#000;font-weight:700>is</span> RequestType<span style=color:#555>.</span>set_var:
+                name, value <span style=color:#555>=</span> args
+                self<span style=color:#555>.</span>namespace[name] <span style=color:#555>=</span> value
+            <span style=color:#069;font-weight:700>elif</span> task <span style=color:#000;font-weight:700>is</span> RequestType<span style=color:#555>.</span>get_var:
+                <span style=color:#09f;font-style:italic># see if we know the name, if we do: set the value to send and</span>
+                <span style=color:#09f;font-style:italic># continue</span>
+                name <span style=color:#555>=</span> args[<span style=color:#f60>0</span>]
+                <span style=color:#069;font-weight:700>if</span> name <span style=color:#000;font-weight:700>in</span> self<span style=color:#555>.</span>namespace:
+                    obj<span style=color:#555>.</span>response <span style=color:#555>=</span> self<span style=color:#555>.</span>namespace[name]
+                    <span style=color:#069;font-weight:700>continue</span>
+
+                <span style=color:#09f;font-style:italic># if we reached here, the name isn&#39;t known yet, put the coro to sleep</span>
+                self<span style=color:#555>.</span>sleep(obj, name)
+                <span style=color:#069;font-weight:700>return</span>
+            <span style=color:#069;font-weight:700>else</span>:
+                <span style=color:#09f;font-style:italic># throw an exception to the coroutine</span>
+                obj<span style=color:#555>.</span>coro<span style=color:#555>.</span>throw(<span style=color:#c00;font-weight:700>ValueError</span>(<span style=color:#c30>&#34;Invalid value yielded to loop&#34;</span>))
+
+    <span style=color:#069;font-weight:700>def</span> <span style=color:#c0f>process</span>(self, procs):
+        <span style=color:#09f;font-style:italic># add processes to our queue</span>
+        self<span style=color:#555>.</span>queue<span style=color:#555>.</span>extend(EventObject(i) <span style=color:#069;font-weight:700>for</span> i <span style=color:#000;font-weight:700>in</span> procs)
+
+        <span style=color:#069;font-weight:700>while</span> self<span style=color:#555>.</span>queue:
+            self<span style=color:#555>.</span>run_once()
+            <span style=color:#09f;font-style:italic># after running once, we should scan and</span>
+            <span style=color:#09f;font-style:italic># see if any names are now known</span>
+            <span style=color:#069;font-weight:700>for</span> name <span style=color:#000;font-weight:700>in</span> <span style=color:#366>tuple</span>(self<span style=color:#555>.</span>waiting<span style=color:#555>.</span>keys()):
+                <span style=color:#069;font-weight:700>if</span> name <span style=color:#000;font-weight:700>in</span> self<span style=color:#555>.</span>namespace:
+                    response <span style=color:#555>=</span> self<span style=color:#555>.</span>namespace[name]
+
+                    <span style=color:#09f;font-style:italic># this name is now known, wake up any coros that were</span>
+                    <span style=color:#09f;font-style:italic># waiting on it and add them to the queue</span>
+                    woke_objs <span style=color:#555>=</span> self<span style=color:#555>.</span>waiting<span style=color:#555>.</span>pop(name)
+
+                    <span style=color:#069;font-weight:700>for</span> obj <span style=color:#000;font-weight:700>in</span> woke_objs:
+                        obj<span style=color:#555>.</span>response <span style=color:#555>=</span> response
+
+                    self<span style=color:#555>.</span>queue<span style=color:#555>.</span>extend(woke_objs)
+</code></pre></div><p>And now we can write some functions that encode a computation of setting or
+getting a variable:</p><div class=highlight><pre style=background-color:#f0f3f3;-moz-tab-size:4;-o-tab-size:4;tab-size:4><code class=language-python data-lang=python><span style=color:#069;font-weight:700>from</span> <span style=color:#0cf;font-weight:700>types</span> <span style=color:#069;font-weight:700>import</span> coroutine
+
+<span style=color:#99f>@coroutine</span>
+<span style=color:#069;font-weight:700>def</span> <span style=color:#c0f>set_var</span>(name, value):
+    <span style=color:#069;font-weight:700>yield</span> RequestType<span style=color:#555>.</span>set_var, name, value
+
+
+<span style=color:#99f>@coroutine</span>
+<span style=color:#069;font-weight:700>def</span> <span style=color:#c0f>get_var</span>(name):
+    <span style=color:#069;font-weight:700>return</span> (<span style=color:#069;font-weight:700>yield</span> RequestType<span style=color:#555>.</span>get_var, name)
+</code></pre></div><p>Now we can write some programs:</p><div class=highlight><pre style=background-color:#f0f3f3;-moz-tab-size:4;-o-tab-size:4;tab-size:4><code class=language-python data-lang=python>async <span style=color:#069;font-weight:700>def</span> <span style=color:#c0f>do_some_math</span>():
+    await set_var(<span style=color:#c30>&#34;one&#34;</span>, <span style=color:#f60>1</span>)
+    await set_var(<span style=color:#c30>&#34;two&#34;</span>, <span style=color:#f60>2</span>)
+    three <span style=color:#555>=</span> await get_var(<span style=color:#c30>&#34;three&#34;</span>)
+    four <span style=color:#555>=</span> await get_var(<span style=color:#c30>&#34;four&#34;</span>)
+    seven <span style=color:#555>=</span> three <span style=color:#555>+</span> four
+    await set_var(<span style=color:#c30>&#34;seven&#34;</span>, seven)
+    <span style=color:#069;font-weight:700>print</span>(<span style=color:#c30>&#34;Done some math&#34;</span>)
+
+async <span style=color:#069;font-weight:700>def</span> <span style=color:#c0f>do_some_more_math</span>():
+    one <span style=color:#555>=</span> await get_var(<span style=color:#c30>&#34;one&#34;</span>)
+    two <span style=color:#555>=</span> await get_var(<span style=color:#c30>&#34;two&#34;</span>)
+    three <span style=color:#555>=</span> one <span style=color:#555>+</span> two
+    four <span style=color:#555>=</span> three <span style=color:#555>+</span> one
+    await set_var(<span style=color:#c30>&#34;three&#34;</span>, three)
+    await set_var(<span style=color:#c30>&#34;four&#34;</span>, four)
+    seven <span style=color:#555>=</span> await get_var(<span style=color:#c30>&#34;seven&#34;</span>)
+    <span style=color:#069;font-weight:700>print</span>(f<span style=color:#c30>&#34;Done some more math, ended with: {seven}&#34;</span>)
+</code></pre></div><p>To run these we would do the following:</p><div class=highlight><pre style=background-color:#f0f3f3;-moz-tab-size:4;-o-tab-size:4;tab-size:4><code class=language-python data-lang=python>loop <span style=color:#555>=</span> ELoop()
+
+procs <span style=color:#555>=</span> [do_some_math(), do_some_more_math()]
+
+loop<span style=color:#555>.</span>process(procs)
+</code></pre></div><p>Running these gives the result:</p><div class=highlight><pre style=background-color:#f0f3f3;-moz-tab-size:4;-o-tab-size:4;tab-size:4><code class=language-python data-lang=python>In [<span style=color:#f60>17</span>]: loop<span style=color:#555>.</span>process(procs)
+Done some math
+Done some more math, ended <span style=color:#069;font-weight:700>with</span>: <span style=color:#f60>7</span>
+</code></pre></div><p>Pretty neat, huh?</p></main><footer><script>(function(){function center_el(tagName){var tags=document.getElementsByTagName(tagName),i,tag;for(i=0;i<tags.length;i++){tag=tags[i];var parent=tag.parentElement;if(parent.childNodes.length===1){if(parent.nodeName==='A'){parent=parent.parentElement;if(parent.childNodes.length!=1)continue;}
+if(parent.nodeName==='P')parent.style.textAlign='center';}}}
+var tagNames=['img','embed','object'];for(var i=0;i<tagNames.length;i++){center_el(tagNames[i]);}})();</script><hr><span class=pull-left><a href=https://github.com/nitros12>GitHub</a> | <a href=https://github.com/nitros12/blog_>Blog Source</a></span>
+<span class=pull-right>This blog was written in <a href=https://www.gnu.org/software/emacs/>Emacs</a></span></footer></body></html>
